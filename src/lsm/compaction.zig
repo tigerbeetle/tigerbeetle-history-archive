@@ -978,10 +978,11 @@ pub fn CompactionType(
 
             const blocks_a = beat_context.blocks.input_data_blocks[cpu.current_split][0];
             const blocks_b = beat_context.blocks.input_data_blocks[cpu.current_split][1];
+            _ = blocks_b;
 
             // FIXME: TODO handle when we have b tables lol
-            const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
-            // const values_b: []const Value = &.{};
+            // const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
+            const values_b: []const Value = &.{};
 
             // // Assert that we're reading data blocks in key order.
             // const values_in = compaction.values_in[index];
