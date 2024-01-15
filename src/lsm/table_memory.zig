@@ -103,6 +103,25 @@ pub fn TableMemoryType(comptime Table: type) type {
             pub fn remaining(self: *const Iterator) usize {
                 return self.table_memory.count() - self.source_index;
             }
+
+            pub fn copy(self: *Iterator, table_builder: *Table.Builder) void {
+                assert(table_builder.value_count < Table.layout.block_value_count_max);
+
+                const values_out = table_builder.data_block_values();
+
+                var values_out_index = table_builder.value_count;
+
+                assert(self.remaining() > 0);
+
+                var len = 0;
+                while (self.next()) |val| {
+                    values_out[values_out_index] = val;
+                    if (values_out_index == Table.layout.block_value_count_max) break;
+                }
+
+                assert(len > 0);
+                table_builder.value_count = values_out_index;
+            }
         };
 
         pub const ValueContext = struct {

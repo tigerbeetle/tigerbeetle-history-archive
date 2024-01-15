@@ -225,107 +225,103 @@ pub fn CompactionType(
             b,
         };
 
-        const ValuesInUnion = union(enum) {
-            values_in: [2][]const Value,
-            values_in_b: struct { *Tree.TableMemory.Iterator, []const Value },
-            need_read,
+        const ValueBlockIterator = struct {
+            values: []const Value,
+            source_index: usize = 0,
+
+            fn init(values: []const Value) ValueBlockIterator {
+                assert(values.len > 0);
+
+                return .{
+                    .values = values,
+                };
+            }
+
+            pub fn next(self: *ValueBlockIterator) ?Table.Value {
+                if (self.source_index == self.values.len) {
+                    return null;
+                }
+
+                const val = self.values[self.source_index];
+                self.source_index += 1;
+
+                return val;
+            }
+
+            pub fn count(self: *const ValueBlockIterator) usize {
+                return self.values.len;
+            }
+
+            pub fn remaining(self: *const ValueBlockIterator) usize {
+                return self.values.len - self.source_index;
+            }
+
+            pub fn copy(self: *ValueBlockIterator, table_builder: *Table.Builder) void {
+                assert(table_builder.value_count < Table.layout.block_value_count_max);
+
+                const values_in = &self.values[self.source_index..];
+                const values_out = table_builder.data_block_values();
+
+                var values_out_index = table_builder.value_count;
+
+                assert(values_in.len > 0);
+
+                const len = @min(values_in.len, values_out.len - values_out_index);
+                assert(len > 0);
+                stdx.copy_disjoint(
+                    .exact,
+                    Value,
+                    values_out[values_out_index..][0..len],
+                    values_in[0..len],
+                );
+
+                self.source_index += len;
+                table_builder.value_count += @as(u32, @intCast(len));
+            }
+        };
+
+        const UnifiedIterator = struct {
+            const Dispatcher = union(enum) {
+                value_block_iterator: ValueBlockIterator,
+                table_memory_iterator: Tree.TableMemory.Iterator,
+            };
+
+            dispatcher: Dispatcher,
+
+            pub fn next(self: *UnifiedIterator) ?Table.Value {
+                return switch (self.dispatcher) {
+                    inline else => |iterator_impl| iterator_impl.next(),
+                };
+            }
+
+            pub fn count(self: *const UnifiedIterator) usize {
+                return switch (self.dispatcher) {
+                    inline else => |iterator_impl| iterator_impl.count(),
+                };
+            }
+
+            pub fn remaining(self: *const UnifiedIterator) usize {
+                return switch (self.dispatcher) {
+                    inline else => |iterator_impl| iterator_impl.remaining(),
+                };
+            }
+
+            pub fn copy(self: *UnifiedIterator, table_builder: *Table.Builder) void {
+                return switch (self.dispatcher) {
+                    inline else => |iterator_impl| iterator_impl.copy(table_builder),
+                };
+            }
+        };
+
+        const ValuesIn = struct {
+            UnifiedIterator,
+            UnifiedIterator,
         };
 
         // FIXME: Think about how we can assert we're getting called in the right order...
         // Since cpu() has data dependencies on both read() and write() memory, we have to split it in half (minimum) to get a working
         // pipeline. We could split it more, but unsure if worth it. This whole structure would need to change.
         const PipelineStage = enum { read, cpu, write };
-        const PipelineContext = struct {
-            const ReadContext = struct {
-                current_split: usize = 0,
-                active: bool = false,
-                callback: BlipCallback = undefined,
-                ptr: *anyopaque = undefined,
-                next_tick: Grid.NextTick = undefined,
-            };
-            const CPUContext = struct {
-                current_split: usize = 0,
-                active: bool = false,
-                callback: BlipCallback = undefined,
-                ptr: *anyopaque = undefined,
-                current_block_a: usize = 0,
-                current_block_b: usize = 0,
-                current_block_a_idx: usize = 0,
-                current_block_b_idx: usize = 0,
-                current_output_data_block: usize = 0,
-                next_tick: Grid.NextTick = undefined,
-            };
-            const WriteContext = struct {
-                current_split: usize = 0,
-                active: bool = false,
-                callback: BlipCallback = undefined,
-                ptr: *anyopaque = undefined,
-                data_blocks_count: usize = 0,
-                next_tick: Grid.NextTick = undefined,
-                timer: std.time.Timer = undefined,
-            };
-            read: ReadContext = .{},
-            cpu: CPUContext = .{},
-            write: WriteContext = .{},
-
-            fn activate_and_assert(self: *PipelineContext, stage: PipelineStage) void {
-                switch (stage) {
-                    .read => {
-                        assert(!self.read.active);
-                        assert(!self.cpu.active or self.cpu.current_split != self.read.current_split);
-                        assert(!self.write.active or self.read.current_split == self.write.current_split);
-
-                        self.read.active = true;
-                    },
-                    .cpu => {
-                        assert(!self.cpu.active);
-                        assert(!self.read.active or self.cpu.current_split != self.read.current_split);
-                        assert(!self.write.active or self.cpu.current_split != self.write.current_split);
-
-                        self.cpu.active = true;
-                    },
-                    .write => {
-                        assert(!self.write.active);
-                        assert(!self.cpu.active or self.cpu.current_split != self.write.current_split);
-                        assert(!self.read.active or self.read.current_split == self.write.current_split);
-
-                        self.write.active = true;
-                    },
-                }
-            }
-
-            fn deactivate_and_assert(self: *PipelineContext, stage: PipelineStage) void {
-                switch (stage) {
-                    .read => {
-                        assert(self.read.active);
-
-                        self.read.current_split = (self.read.current_split + 1) % 2;
-                        self.read.active = false;
-                        self.read.callback = undefined;
-                    },
-                    .cpu => {
-                        assert(self.cpu.active);
-
-                        self.cpu.current_split = (self.cpu.current_split + 1) % 2;
-                        self.cpu.active = false;
-                        self.cpu.callback = undefined;
-                    },
-                    .write => {
-                        assert(self.write.active);
-
-                        self.write.current_split = (self.write.current_split + 1) % 2;
-                        self.write.active = false;
-                        self.write.callback = undefined;
-                    },
-                }
-            }
-
-            fn assert_all_inactive(self: *PipelineContext) void {
-                assert(!self.read.active);
-                assert(!self.cpu.active);
-                assert(!self.write.active);
-            }
-        };
 
         const BarContext = struct {
             tree: *Tree,
@@ -384,6 +380,37 @@ pub fn CompactionType(
         };
 
         const BeatContext = struct {
+            const ReadContext = struct {
+                current_split: usize = 0,
+                active: bool = false,
+                callback: ?BlipCallback = null,
+                ptr: *anyopaque = undefined,
+                next_tick: Grid.NextTick = undefined,
+                timer: std.time.Timer = undefined,
+            };
+            const CPUContext = struct {
+                current_split: usize = 0,
+                active: bool = false,
+                callback: ?BlipCallback = null,
+                ptr: *anyopaque = undefined,
+                current_block_a: usize = 0,
+                current_block_b: usize = 0,
+                current_block_a_idx: usize = 0,
+                current_block_b_idx: usize = 0,
+                current_output_data_block: usize = 0,
+                next_tick: Grid.NextTick = undefined,
+                timer: std.time.Timer = undefined,
+            };
+            const WriteContext = struct {
+                current_split: usize = 0,
+                active: bool = false,
+                callback: ?BlipCallback = null,
+                ptr: *anyopaque = undefined,
+                data_blocks_count: usize = 0,
+                next_tick: Grid.NextTick = undefined,
+                timer: std.time.Timer = undefined,
+            };
+
             grid_reservation: ?Grid.Reservation,
 
             // Index blocks don't have the same data dependency on cpu that data blocks do.
@@ -401,7 +428,85 @@ pub fn CompactionType(
 
             pending_writes: usize = 0,
 
-            pipeline_context: PipelineContext = .{},
+            read: ReadContext = .{},
+            cpu: CPUContext = .{},
+            write: WriteContext = .{},
+
+            fn activate_and_assert(self: *BeatContext, stage: PipelineStage) void {
+                switch (stage) {
+                    .read => {
+                        assert(!self.read.active);
+                        assert(!self.cpu.active or self.cpu.current_split != self.read.current_split);
+                        assert(!self.write.active or self.read.current_split == self.write.current_split);
+
+                        self.read.active = true;
+                    },
+                    .cpu => {
+                        assert(!self.cpu.active);
+                        assert(!self.read.active or self.cpu.current_split != self.read.current_split);
+                        assert(!self.write.active or self.cpu.current_split != self.write.current_split);
+
+                        self.cpu.active = true;
+                    },
+                    .write => {
+                        assert(!self.write.active);
+                        assert(!self.cpu.active or self.cpu.current_split != self.write.current_split);
+                        assert(!self.read.active or self.read.current_split == self.write.current_split);
+
+                        self.write.active = true;
+                    },
+                }
+            }
+
+            fn deactivate_and_assert_and_callback(self: *BeatContext, stage: PipelineStage, arg1: ?bool, arg2: ?bool) void {
+                switch (stage) {
+                    .read => {
+                        assert(self.read.active);
+                        assert(self.read.callback != null);
+
+                        const callback = self.read.callback.?;
+                        const ptr = self.read.ptr;
+
+                        self.read.current_split = (self.read.current_split + 1) % 2;
+                        self.read.active = false;
+                        self.read.callback = null;
+
+                        callback(ptr, arg1, arg2);
+                    },
+                    .cpu => {
+                        assert(self.cpu.active);
+                        assert(self.cpu.callback != null);
+
+                        const callback = self.cpu.callback.?;
+                        const ptr = self.cpu.ptr;
+
+                        self.cpu.current_split = (self.cpu.current_split + 1) % 2;
+                        self.cpu.active = false;
+                        self.cpu.callback = null;
+
+                        callback(ptr, arg1, arg2);
+                    },
+                    .write => {
+                        assert(self.write.active);
+                        assert(self.write.callback != null);
+
+                        const callback = self.write.callback.?;
+                        const ptr = self.write.ptr;
+
+                        self.write.current_split = (self.write.current_split + 1) % 2;
+                        self.write.active = false;
+                        self.write.callback = null;
+
+                        callback(ptr, arg1, arg2);
+                    },
+                }
+            }
+
+            fn assert_all_inactive(self: *BeatContext) void {
+                assert(!self.read.active);
+                assert(!self.cpu.active);
+                assert(!self.write.active);
+            }
         };
 
         // Passed by `init`.
@@ -543,9 +648,6 @@ pub fn CompactionType(
                 });
 
                 const perform_move_table = range_b.tables.empty();
-                if (perform_move_table) {
-                    compaction.move_table();
-                }
 
                 total_value_count += table_a.value_count;
                 for (range_b.tables.const_slice()) |*table| total_value_count += table.table_info.value_count;
@@ -568,6 +670,11 @@ pub fn CompactionType(
                     .output_index_blocks = undefined,
                     .beat_budget = null,
                 };
+
+                if (perform_move_table) {
+                    compaction.move_table();
+                    return null;
+                }
             }
 
             assert(compaction.bar_context.?.drop_tombstones or compaction.level_b < constants.lsm_levels - 1);
@@ -585,13 +692,15 @@ pub fn CompactionType(
             assert(compaction.bar_context != null);
             assert(compaction.bar_context.?.per_beat_input_goal == 0);
             assert(compaction.beat_context == null);
+            // FIXME: Assert beat budget is less than or equal to number of beats in a bar :)
 
             compaction.bar_context.?.per_beat_input_goal = stdx.div_ceil(compaction.bar_context.?.total_value_count, beat_budget);
             compaction.bar_context.?.output_index_blocks = output_index_blocks;
 
             if (compaction.bar_context.?.move_table) {
-                assert(output_index_blocks.len == 0);
-                assert(compaction.bar_context.?.per_beat_input_goal == 0);
+                // FIXME: Asserts here
+                // assert(output_index_blocks.len == 0);
+                // assert(compaction.bar_context.?.per_beat_input_goal == 0);
             } else {
                 assert(output_index_blocks.len > 0);
                 assert(compaction.bar_context.?.per_beat_input_goal > 0);
@@ -678,8 +787,8 @@ pub fn CompactionType(
 
             // FIXME: This sets the initial data block...
             if (bar_context.table_builder.state == .index_block) {
-                std.log.info("Setting write block...... to split: {}", .{beat_context.pipeline_context.write.current_split});
-                bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.pipeline_context.write.current_split][0]);
+                std.log.info("Setting write block...... to split: {}", .{beat_context.write.current_split});
+                bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.write.current_split][0]);
             }
         }
 
@@ -734,13 +843,13 @@ pub fn CompactionType(
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
 
-            beat_context.pipeline_context.activate_and_assert(.read);
+            beat_context.activate_and_assert(.read);
 
             // FIXME: Move these to activate and assert?
-            beat_context.pipeline_context.read.callback = callback;
-            beat_context.pipeline_context.read.ptr = ptr;
+            beat_context.read.callback = callback;
+            beat_context.read.ptr = ptr;
 
-            compaction.grid.on_next_tick(blip_read_next_tick, &beat_context.pipeline_context.read.next_tick);
+            compaction.grid.on_next_tick(blip_read_next_tick, &beat_context.read.next_tick);
 
             // callback:  void
             // FIXME: Verify the value count matches the number of values we actually compact.
@@ -799,17 +908,15 @@ pub fn CompactionType(
             // );
         }
 
-        fn blip_read_index_callback(read: *Grid.Read, block: BlockPtrConst) void {
+        fn blip_read_index_callback(read: *Grid.Read, index_block: BlockPtrConst) void {
             const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", read).target));
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
-            // assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
+            assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
 
             const bar_context = &compaction.bar_context.?;
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
-
-            // assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
 
             // const index_schema_a = schema.TableIndex.from(compaction.index_block_a);
             // compaction.iterator_a.start(.{
@@ -826,7 +933,7 @@ pub fn CompactionType(
 
             // FIXME: Not sure if I like this too much. According to release_table_blocks, it'll only release at the end of the bar, so should be ok?
             // FIXME: It's critical to release blocks, so ensure this is done properly.
-            compaction.release_table_blocks(block);
+            compaction.release_table_blocks(index_block);
 
             if (beat_context.pending_index_reads != 0) return;
 
@@ -850,38 +957,30 @@ pub fn CompactionType(
             beat_context.pending_data_reads -= 1;
             if (beat_context.pending_data_reads != 0) return;
 
-            beat_context.pipeline_context.deactivate_and_assert(.read);
+            beat_context.deactivate_and_assert(.read);
         }
 
         fn blip_read_next_tick(next_tick: *Grid.NextTick) void {
-            const read_pipeline_context = @fieldParentPtr(PipelineContext.ReadContext, "next_tick", next_tick);
-            const pipeline_context = @fieldParentPtr(PipelineContext, "read", read_pipeline_context);
-            const beat_context = @fieldParentPtr(BeatContext, "pipeline_context", pipeline_context);
+            const read_context = @fieldParentPtr(BeatContext.ReadContext, "next_tick", next_tick);
+            const beat_context = @fieldParentPtr(BeatContext, "read", read_context);
             // const beat_context: *?BeatContext = @ptrCast(@fieldParentPtr(BeatContext, "pipeline_context", pipeline_context));
             // const compaction = @fieldParentPtr(Compaction, "beat_context", beat_context);
             // _ = compaction;
 
-            const callback = read_pipeline_context.callback;
-            const ptr = read_pipeline_context.ptr;
-
-            // So this makes callback / ptr null :/
-            beat_context.pipeline_context.deactivate_and_assert(.read);
-
-            callback(ptr, null, null);
+            beat_context.deactivate_and_assert_and_callback(.read, null, null);
         }
 
-        fn calculate_values_in(compaction: *Compaction) ValuesInUnion {
+        fn calculate_values_in(compaction: *Compaction) ValuesIn {
             assert(compaction.beat_context != null);
             const beat_context = &compaction.beat_context.?;
-            const cpu = &beat_context.pipeline_context.cpu;
+            const cpu = &beat_context.cpu;
 
             const blocks_a = beat_context.blocks.input_data_blocks[cpu.current_split][0];
             const blocks_b = beat_context.blocks.input_data_blocks[cpu.current_split][1];
-            _ = blocks_b;
 
             // FIXME: TODO handle when we have b tables lol
-            // const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
-            const values_b = &.{};
+            const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
+            // const values_b: []const Value = &.{};
 
             // // Assert that we're reading data blocks in key order.
             // const values_in = compaction.values_in[index];
@@ -904,12 +1003,25 @@ pub fn CompactionType(
             // FIXME: Assert we're not exhausted.
             switch (compaction.bar_context.?.table_info_a) {
                 .immutable => {
-                    std.log.info("Hello from {*}", .{&compaction.bar_context.?.table_info_a.immutable});
-                    return .{ .values_in_b = .{ &compaction.bar_context.?.table_info_a.immutable, values_b } };
+                    return .{
+                        UnifiedIterator{ .dispatcher = .{
+                            .table_memory_iterator = compaction.bar_context.?.table_info_a.immutable,
+                        } },
+                        UnifiedIterator{ .dispatcher = .{
+                            .value_block_iterator = ValueBlockIterator.init(values_b),
+                        } },
+                    };
                 },
                 .disk => {
                     const values_a = Table.data_block_values_used(blocks_a[cpu.current_block_a])[cpu.current_block_a_idx..];
-                    return .{ .values_in = .{ values_a, values_b } };
+                    return .{
+                        UnifiedIterator{ .dispatcher = .{
+                            .value_block_iterator = ValueBlockIterator.init(values_a),
+                        } },
+                        UnifiedIterator{ .dispatcher = .{
+                            .value_block_iterator = ValueBlockIterator.init(values_b),
+                        } },
+                    };
                 },
             }
         }
@@ -931,13 +1043,12 @@ pub fn CompactionType(
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
 
-            beat_context.pipeline_context.activate_and_assert(.cpu);
+            beat_context.activate_and_assert(.cpu);
+            beat_context.cpu.callback = callback;
+            beat_context.cpu.ptr = ptr;
 
-            const CPUFns = struct {
-                copy: *const fn (*Table.Builder, *ValuesInUnion, InputLevel) void,
-                copy_drop_tombstones: *const fn (*Table.Builder, *ValuesInUnion) void,
-                merge: *const fn (*Table.Builder, *ValuesInUnion, bool) void,
-            };
+            beat_context.cpu.timer = std.time.Timer.start() catch unreachable;
+            beat_context.cpu.timer.reset();
 
             var beat_exhausted = false;
             var bar_exhausted = false;
@@ -947,35 +1058,20 @@ pub fn CompactionType(
                 assert(bar_context.table_builder.value_count < Table.layout.block_value_count_max);
 
                 var values_in = compaction.calculate_values_in();
-                if (values_in == .need_read) {
-                    // FIXME: Assert that we never need_read on our first iteration.
-                    // FIXME: TODO
-                    return;
-                }
+                // if (values_in == .need_read) {
+                //     // FIXME: Assert that we never need_read on our first iteration.
+                //     // FIXME: TODO
+                //     return;
+                // }
 
-                var values_in_a_len = switch (values_in) {
-                    .values_in => |v| v[0].len,
-                    .values_in_b => |v| v[0].remaining(),
-                    .need_read => unreachable,
-                };
-                var values_in_b_len = switch (values_in) {
-                    .values_in => |v| v[1].len,
-                    .values_in_b => |v| v[1].len,
-                    .need_read => unreachable,
-                };
-
-                // FIXME: Switch this to having an iterator that wraps TableMemory.iterator and []const Value, with an optimized copy() fn.
-                const cpu_fns: CPUFns = switch (values_in) {
-                    .values_in => .{ .copy = copy, .copy_drop_tombstones = copy_drop_tombstones, .merge = merge },
-                    .values_in_b => .{ .copy = copy_iterator, .copy_drop_tombstones = copy_drop_tombstones_iterator, .merge = merge_iterator },
-                    .need_read => unreachable,
-                };
+                var values_in_a_len = values_in[0].remaining();
+                var values_in_b_len = values_in[1].remaining();
 
                 // Set the data block if needed
                 if (bar_context.table_builder.state == .index_block)
-                    bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.pipeline_context.cpu.current_split][beat_context.pipeline_context.cpu.current_output_data_block]);
+                    bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.cpu.current_split][beat_context.cpu.current_output_data_block]);
 
-                std.log.info("blip_cpu: values_a: {} and values_b: {} current cpu split: {}", .{ values_in_a_len, values_in_b_len, beat_context.pipeline_context.cpu.current_split });
+                std.log.info("blip_cpu: values_a: {} and values_b: {} current cpu split: {}", .{ values_in_a_len, values_in_b_len, beat_context.cpu.current_split });
 
                 // We are responsible for not iterating again if all work is done.
                 assert(values_in_a_len > 0 or values_in_b_len > 0);
@@ -983,28 +1079,21 @@ pub fn CompactionType(
                 // Loop through the CPU work until we have nothing left.
                 while (values_in_a_len > 0 or values_in_b_len > 0) {
                     if (values_in_a_len == 0) {
-                        cpu_fns.copy(&bar_context.table_builder, &values_in, .b);
+                        values_in[1].copy(&bar_context.table_builder);
                     } else if (values_in_b_len == 0) {
                         if (bar_context.drop_tombstones) {
-                            cpu_fns.copy_drop_tombstones(&bar_context.table_builder, &values_in);
+                            copy_drop_tombstones(&bar_context.table_builder, &values_in);
                         } else {
-                            cpu_fns.copy(&bar_context.table_builder, &values_in, .a);
+                            values_in[0].copy(&bar_context.table_builder);
                         }
                     } else {
-                        cpu_fns.merge(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
+                        merge(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
                     }
 
                     // FIXME: Update these in a nicer way...
-                    const values_in_a_len_new = switch (values_in) {
-                        .values_in => |v| v[0].len,
-                        .values_in_b => |v| v[0].remaining(),
-                        .need_read => unreachable,
-                    };
-                    const values_in_b_len_new = switch (values_in) {
-                        .values_in => |v| v[1].len,
-                        .values_in_b => |v| v[1].len,
-                        .need_read => unreachable,
-                    };
+                    const values_in_a_len_new = values_in[0].remaining();
+                    const values_in_b_len_new = values_in[1].remaining();
+
                     beat_context.input_values_processed += (values_in_a_len - values_in_a_len_new) + (values_in_b_len - values_in_b_len_new);
                     values_in_a_len = values_in_a_len_new;
                     values_in_b_len = values_in_b_len_new;
@@ -1032,8 +1121,8 @@ pub fn CompactionType(
                         // If we have to write, we need to break out of the outer loop.
                         .need_write => {
                             // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
-                            beat_context.pipeline_context.write.data_blocks_count = beat_context.pipeline_context.cpu.current_output_data_block;
-                            beat_context.pipeline_context.cpu.current_output_data_block = 0; // FIXME: HACK where to we do resetting between etc!!
+                            beat_context.write.data_blocks_count = beat_context.cpu.current_output_data_block;
+                            beat_context.cpu.current_output_data_block = 0; // FIXME: HACK where to we do resetting between etc!!
                             break :outer;
                         },
                     }
@@ -1044,12 +1133,10 @@ pub fn CompactionType(
             // assert(filled <= target.len);
             // if (filled == 0) assert(Table.usage == .secondary_index);
 
-            beat_context.pipeline_context.deactivate_and_assert(.cpu);
+            const d = beat_context.cpu.timer.read();
+            std.log.info("Took {} to CPU merge block", .{std.fmt.fmtDuration(d)});
 
-            // FIXME: Move these to activate and assert?
-            beat_context.pipeline_context.cpu.callback = callback;
-            beat_context.pipeline_context.cpu.ptr = ptr;
-            callback(ptr, beat_exhausted or bar_exhausted, bar_exhausted);
+            beat_context.deactivate_and_assert_and_callback(.cpu, beat_exhausted or bar_exhausted, bar_exhausted);
         }
 
         // FIXME: Make input_exhausted a struct rather
@@ -1059,7 +1146,7 @@ pub fn CompactionType(
 
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
-            const cpu = &beat_context.pipeline_context.cpu;
+            const cpu = &beat_context.cpu;
 
             assert(cpu.active);
 
@@ -1137,16 +1224,16 @@ pub fn CompactionType(
             const bar_context = &compaction.bar_context.?;
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
-            const write = &beat_context.pipeline_context.write;
+            const write = &beat_context.write;
 
             write.timer = std.time.Timer.start() catch unreachable;
             write.timer.reset();
 
-            beat_context.pipeline_context.activate_and_assert(.write);
+            beat_context.activate_and_assert(.write);
 
             // FIXME: Move these to activate and assert?
-            beat_context.pipeline_context.write.callback = callback;
-            beat_context.pipeline_context.write.ptr = ptr;
+            beat_context.write.callback = callback;
+            beat_context.write.ptr = ptr;
 
             // Write any complete index blocks.
             // FIXME: The interaction of this is painful.
@@ -1177,7 +1264,7 @@ pub fn CompactionType(
             // FIXME: The big idea is to make compaction pacing explicit and asserted behaviour rather than just an implicit property of the code
 
             // FIXME: We need to deactivate if we have 0 blocks to write, and call our callback etc.
-            // beat_context.pipeline_context.deactivate_and_assert(.write);
+            // beat_context.deactivate_and_assert(.write);
         }
 
         fn blip_write_callback(write: *Grid.Write) void {
@@ -1194,19 +1281,12 @@ pub fn CompactionType(
 
             beat_context.pending_writes -= 1;
 
-            // std.log.info("blip_write_callback for split {}", .{beat_context.pipeline_context.write.current_split});
+            // std.log.info("blip_write_callback for split {}", .{beat_context.write.current_split});
 
             if (beat_context.pending_writes == 0) {
-                const duration = beat_context.pipeline_context.write.timer.read();
+                const duration = beat_context.write.timer.read();
                 std.log.info("all writes done - took {}! callback time!!", .{std.fmt.fmtDuration(duration)});
-                const callback = beat_context.pipeline_context.write.callback;
-                const ptr = beat_context.pipeline_context.write.ptr;
-
-                // FIXME: This style is gross! deactivate_and_assert clears the callback / ptr.
-                beat_context.pipeline_context.deactivate_and_assert(.write);
-
-                callback(ptr, null, null);
-                // compaction.write_finish();
+                beat_context.deactivate_and_assert_and_callback(.write, null, null);
             }
         }
 
@@ -1217,12 +1297,11 @@ pub fn CompactionType(
             }
 
             assert(compaction.bar_context != null);
-
             assert(compaction.beat_context != null);
 
             const beat_context = &compaction.beat_context.?;
 
-            beat_context.pipeline_context.assert_all_inactive();
+            beat_context.assert_all_inactive();
             assert(compaction.bar_context.?.table_builder.data_block_empty());
             // assert(compaction.bar_context.?.table_builder.state == .index_block); // Hmmm
             assert(beat_context.pending_index_reads == 0);
@@ -1317,8 +1396,6 @@ pub fn CompactionType(
         }
 
         /// If we can just move the table, don't bother with merging.
-        // FIXME: For now, move_table will happen in the prepare step, but we still have to pulse
-        // through the (useless) read / merge / write steps before finalizing it.
         fn move_table(compaction: *Compaction) void {
             const bar_context = &compaction.bar_context.?;
 
@@ -1353,54 +1430,20 @@ pub fn CompactionType(
 
         ////////////// The actual CPU merging methods below. //////////////
         // TODO: Add benchmarks for all of these specifically.
-        // FIXME: The split between iterator and non-iterator versions is messy :/
-        fn copy(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, input_level: InputLevel) void {
-            assert(values_in_union.* == .values_in);
-            const values_in = &values_in_union.values_in;
-
-            assert(values_in[@intFromEnum(input_level) +% 1].len == 0);
-            assert(table_builder.value_count < Table.layout.block_value_count_max);
-
-            const values_in_level = values_in[@intFromEnum(input_level)];
-            const values_out = table_builder.data_block_values();
-            var values_out_index = table_builder.value_count;
-
-            assert(values_in_level.len > 0);
-
-            const len = @min(values_in_level.len, values_out.len - values_out_index);
-            assert(len > 0);
-            stdx.copy_disjoint(
-                .exact,
-                Value,
-                values_out[values_out_index..][0..len],
-                values_in_level[0..len],
-            );
-
-            values_in[@intFromEnum(input_level)] = values_in_level[len..];
-            table_builder.value_count += @as(u32, @intCast(len));
-        }
-
-        fn copy_drop_tombstones(table_builder: *Table.Builder, values_in_union: *ValuesInUnion) void {
-            assert(values_in_union.* == .values_in);
-            const values_in = &values_in_union.values_in;
-
-            assert(values_in[1].len == 0);
+        fn copy_drop_tombstones(table_builder: *Table.Builder, values_in: *ValuesIn) void {
+            assert(values_in[1].remaining() == 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);
 
             // Copy variables locally to ensure a tight loop.
-            const values_in_a = values_in[0];
+            var values_in_a = values_in[0];
             const values_out = table_builder.data_block_values();
-            var values_in_a_index: usize = 0;
             var values_out_index = table_builder.value_count;
 
             // Merge as many values as possible.
-            while (values_in_a_index < values_in_a.len and
-                values_out_index < values_out.len)
-            {
-                const value_a = &values_in_a[values_in_a_index];
-
-                values_in_a_index += 1;
+            while (values_in_a.next()) |value_a| {
+                // FIXME: Check values_out_index < values_out.len
                 if (tombstone(value_a)) {
+                    // TODO: What's the impact of this check?
                     assert(Table.usage != .secondary_index);
                     continue;
                 }
@@ -1409,200 +1452,75 @@ pub fn CompactionType(
             }
 
             // Copy variables back out.
-            values_in[0] = values_in_a[values_in_a_index..];
-            table_builder.value_count = values_out_index;
-        }
-
-        fn merge(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, drop_tombstones: bool) void {
-            assert(values_in_union.* == .values_in);
-            const values_in = &values_in_union.values_in;
-
-            assert(values_in[0].len > 0);
-            assert(values_in[1].len > 0);
-            assert(table_builder.value_count < Table.layout.block_value_count_max);
-
-            // Copy variables locally to ensure a tight loop.
-            const values_in_a = values_in[0];
-            const values_in_b = values_in[1];
-            const values_out = table_builder.data_block_values();
-            var values_in_a_index: usize = 0;
-            var values_in_b_index: usize = 0;
-            var values_out_index = table_builder.value_count;
-
-            // Merge as many values as possible.
-            while (values_in_a_index < values_in_a.len and
-                values_in_b_index < values_in_b.len and
-                values_out_index < values_out.len)
-            {
-                const value_a = &values_in_a[values_in_a_index];
-                const value_b = &values_in_b[values_in_b_index];
-                switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
-                    .lt => {
-                        values_in_a_index += 1;
-                        if (drop_tombstones and
-                            tombstone(value_a))
-                        {
-                            assert(Table.usage != .secondary_index);
-                            continue;
-                        }
-                        values_out[values_out_index] = value_a.*;
-                        values_out_index += 1;
-                    },
-                    .gt => {
-                        values_in_b_index += 1;
-                        values_out[values_out_index] = value_b.*;
-                        values_out_index += 1;
-                    },
-                    .eq => {
-                        values_in_a_index += 1;
-                        values_in_b_index += 1;
-
-                        if (Table.usage == .secondary_index) {
-                            // Secondary index optimization --- cancel out put and remove.
-                            assert(tombstone(value_a) != tombstone(value_b));
-                            continue;
-                        } else if (drop_tombstones) {
-                            if (tombstone(value_a)) {
-                                continue;
-                            }
-                        }
-
-                        values_out[values_out_index] = value_a.*;
-                        values_out_index += 1;
-                    },
-                }
-            }
-
-            // Copy variables back out.
-            values_in[0] = values_in_a[values_in_a_index..];
-            values_in[1] = values_in_b[values_in_b_index..];
-            table_builder.value_count = values_out_index;
-        }
-
-        fn copy_iterator(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, input_level: InputLevel) void {
-            assert(false); // FIXME: Not done
-            assert(values_in_union.* == .values_in);
-            const values_in = &values_in_union.values_in;
-
-            assert(values_in[@intFromEnum(input_level) +% 1].len == 0);
-            assert(table_builder.value_count < Table.layout.block_value_count_max);
-
-            const values_in_level = values_in[@intFromEnum(input_level)];
-            const values_out = table_builder.data_block_values();
-            var values_out_index = table_builder.value_count;
-
-            assert(values_in_level.len > 0);
-
-            const len = @min(values_in_level.len, values_out.len - values_out_index);
-            assert(len > 0);
-            stdx.copy_disjoint(
-                .exact,
-                Value,
-                values_out[values_out_index..][0..len],
-                values_in_level[0..len],
-            );
-
-            values_in[@intFromEnum(input_level)] = values_in_level[len..];
-            table_builder.value_count += @as(u32, @intCast(len));
-        }
-
-        fn copy_drop_tombstones_iterator(table_builder: *Table.Builder, values_in_union: *ValuesInUnion) void {
-            assert(values_in_union.* == .values_in_b);
-            const values_in = &values_in_union.values_in_b;
-
-            assert(values_in[1].len == 0);
-            assert(table_builder.value_count < Table.layout.block_value_count_max);
-
-            // Copy variables locally to ensure a tight loop.
-            const values_in_a = values_in[0];
-            const values_out = table_builder.data_block_values();
-            var values_out_index = table_builder.value_count;
-
-            // Merge as many values as possible.
-            while (values_out_index < values_out.len) {
-                const maybe_value_a = values_in_a.next();
-                if (maybe_value_a) |*value_a| {
-                    if (tombstone(value_a)) {
-                        assert(Table.usage != .secondary_index);
-                        continue;
-                    }
-                    values_out[values_out_index] = value_a.*;
-                    values_out_index += 1;
-                } else {
-                    break;
-                }
-            }
-
-            // Copy variables back out.
             values_in[0] = values_in_a;
             table_builder.value_count = values_out_index;
         }
 
-        fn merge_iterator(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, drop_tombstones: bool) void {
-            assert(false); // FIXME: Not done
-            assert(values_in_union.* == .values_in);
-            const values_in = &values_in_union.values_in;
+        fn merge(table_builder: *Table.Builder, values_in: *ValuesIn, drop_tombstones: bool) void {
+            _ = drop_tombstones;
+            _ = values_in;
+            _ = table_builder;
+            assert(false); // Merge todo still
+            //     assert(values_in[0].remaining() > 0);
+            //     assert(values_in[1].remaining() > 0);
+            //     assert(table_builder.value_count < Table.layout.block_value_count_max);
 
-            assert(values_in[0].len > 0);
-            assert(values_in[1].len > 0);
-            assert(table_builder.value_count < Table.layout.block_value_count_max);
+            //     // Copy variables locally to ensure a tight loop.
+            //     const values_in_a = values_in[0];
+            //     const values_in_b = values_in[1];
+            //     const values_out = table_builder.data_block_values();
+            //     var values_in_a_index: usize = 0;
+            //     var values_in_b_index: usize = 0;
+            //     var values_out_index = table_builder.value_count;
 
-            // Copy variables locally to ensure a tight loop.
-            const values_in_a = values_in[0];
-            const values_in_b = values_in[1];
-            const values_out = table_builder.data_block_values();
-            var values_in_a_index: usize = 0;
-            var values_in_b_index: usize = 0;
-            var values_out_index = table_builder.value_count;
+            //     // Merge as many values as possible.
+            //     while (values_in_a_index < values_in_a.len and
+            //         values_in_b_index < values_in_b.len and
+            //         values_out_index < values_out.len)
+            //     {
+            //         const value_a = &values_in_a[values_in_a_index];
+            //         const value_b = &values_in_b[values_in_b_index];
+            //         switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
+            //             .lt => {
+            //                 values_in_a_index += 1;
+            //                 if (drop_tombstones and
+            //                     tombstone(value_a))
+            //                 {
+            //                     assert(Table.usage != .secondary_index);
+            //                     continue;
+            //                 }
+            //                 values_out[values_out_index] = value_a.*;
+            //                 values_out_index += 1;
+            //             },
+            //             .gt => {
+            //                 values_in_b_index += 1;
+            //                 values_out[values_out_index] = value_b.*;
+            //                 values_out_index += 1;
+            //             },
+            //             .eq => {
+            //                 values_in_a_index += 1;
+            //                 values_in_b_index += 1;
 
-            // Merge as many values as possible.
-            while (values_in_a_index < values_in_a.len and
-                values_in_b_index < values_in_b.len and
-                values_out_index < values_out.len)
-            {
-                const value_a = &values_in_a[values_in_a_index];
-                const value_b = &values_in_b[values_in_b_index];
-                switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
-                    .lt => {
-                        values_in_a_index += 1;
-                        if (drop_tombstones and
-                            tombstone(value_a))
-                        {
-                            assert(Table.usage != .secondary_index);
-                            continue;
-                        }
-                        values_out[values_out_index] = value_a.*;
-                        values_out_index += 1;
-                    },
-                    .gt => {
-                        values_in_b_index += 1;
-                        values_out[values_out_index] = value_b.*;
-                        values_out_index += 1;
-                    },
-                    .eq => {
-                        values_in_a_index += 1;
-                        values_in_b_index += 1;
+            //                 if (Table.usage == .secondary_index) {
+            //                     // Secondary index optimization --- cancel out put and remove.
+            //                     assert(tombstone(value_a) != tombstone(value_b));
+            //                     continue;
+            //                 } else if (drop_tombstones) {
+            //                     if (tombstone(value_a)) {
+            //                         continue;
+            //                     }
+            //                 }
 
-                        if (Table.usage == .secondary_index) {
-                            // Secondary index optimization --- cancel out put and remove.
-                            assert(tombstone(value_a) != tombstone(value_b));
-                            continue;
-                        } else if (drop_tombstones) {
-                            if (tombstone(value_a)) {
-                                continue;
-                            }
-                        }
+            //                 values_out[values_out_index] = value_a.*;
+            //                 values_out_index += 1;
+            //             },
+            //         }
+            //     }
 
-                        values_out[values_out_index] = value_a.*;
-                        values_out_index += 1;
-                    },
-                }
-            }
-
-            // Copy variables back out.
-            values_in[0] = values_in_a[values_in_a_index..];
-            values_in[1] = values_in_b[values_in_b_index..];
-            table_builder.value_count = values_out_index;
+            //     // Copy variables back out.
+            //     values_in[0] = values_in_a[values_in_a_index..];
+            //     values_in[1] = values_in_b[values_in_b_index..];
+            //     table_builder.value_count = values_out_index;
         }
     };
 }

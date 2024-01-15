@@ -654,7 +654,8 @@ pub fn ManifestLogType(comptime Storage: type) type {
             assert(manifest_log.blocks.count ==
                 manifest_log.blocks_closed + @intFromBool(manifest_log.entry_count > 0));
             assert(manifest_log.compact_blocks == null);
-            assert(op % @divExact(constants.lsm_batch_multiple, 2) == 0);
+            std.log.info("Manifest compaction running for op: {}", .{op});
+            assert((op + 1) % constants.lsm_batch_multiple == 0);
 
             if (op < constants.lsm_batch_multiple or
                 manifest_log.superblock.working.vsr_state.op_compacted(op))
@@ -674,6 +675,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             );
             assert(manifest_log.compact_blocks.? <= manifest_log.pace.half_bar_compact_blocks_max);
 
+            std.log.info("Manifest reserve...", .{});
             manifest_log.grid_reservation = manifest_log.grid.reserve(
                 manifest_log.compact_blocks.? +
                     manifest_log.pace.half_bar_append_blocks_max,
@@ -819,6 +821,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             assert(manifest_log.write_callback == null);
 
             if (manifest_log.grid_reservation) |grid_reservation| {
+                std.log.info("Manifest forfeit...", .{});
                 manifest_log.grid.forfeit(grid_reservation);
                 manifest_log.grid_reservation = null;
             } else {

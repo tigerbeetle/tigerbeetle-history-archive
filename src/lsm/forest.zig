@@ -567,6 +567,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             },
         } = null,
 
+        // FIXME: Bad name, this is manifest + pipeline.
+        compactions_running: usize = 0,
+
         grid: *Grid,
         grooves: Grooves,
         node_pool: *NodePool,
@@ -729,6 +732,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             // Note: The first beat of the first bar is a special case. It has op 1, and so
             // no bar_setup is called. bar_finish compensates for this internally currently.
             const first_beat = compaction_beat == 0;
+            const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
 
             // Setup loop, runs only on the first beat of every bar, before any async work is done.
             if (first_beat) {
@@ -764,60 +768,34 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             // Compaction only starts > lsm_batch_multiple because nothing compacts in the first bar.
             assert(op >= constants.lsm_batch_multiple or forest.compaction_pipeline.compactions.count() == 0);
 
+            forest.compactions_running += 1;
             forest.compaction_pipeline.beat(forest, op, compact_callback);
 
-            // Manifest log compaction.
-            if (op % @divExact(constants.lsm_batch_multiple, 2) == 0) {
-                assert(forest.manifest_log_progress == .idle);
-
+            // Manifest log compaction. Run on the last beat of the bar.
+            // FIXME: Figure out a plan wrt the pacing here. Putting it on the last beat kinda sorta balances out, because we expect
+            // to naturally do less other compaction work on the last beat.
+            // The first bar has no manifest compaction.
+            if (last_beat and op > constants.lsm_batch_multiple) {
                 forest.manifest_log_progress = .compacting;
                 forest.manifest_log.compact(compact_manifest_log_callback, op);
+                forest.compactions_running += 1;
             } else {
-                if (op == 1) {
-                    assert(forest.manifest_log_progress == .idle);
-                    forest.manifest_log_progress = .skip;
-                } else {
-                    assert(forest.manifest_log_progress != .idle);
-                }
+                assert(forest.manifest_log_progress == .idle);
             }
         }
 
         fn compact_callback(forest: *Forest) void {
             assert(forest.progress.? == .compact);
+            std.log.info("Entering compact_callback, running is: {} before decrement", .{forest.compactions_running});
+            forest.compactions_running -= 1;
+            if (forest.compactions_running > 0) {
+                return;
+            }
             // assert(forest.manifest_log_progress != .idle);
             forest.verify_table_extents();
 
             const progress = &forest.progress.?.compact;
 
-            // Call sync finish code.
-            forest.compact_end();
-
-            // const half_bar_end =
-            //     (progress.op + 1) % @divExact(constants.lsm_batch_multiple, 2) == 0;
-            // // On the last beat of the bar, make sure that manifest log compaction is finished.
-            // if (half_bar_end and forest.manifest_log_progress == .compacting) return;
-
-            // FIXME
-            // inline for (std.meta.fields(Grooves)) |field| {
-            //     @field(forest.grooves, field.name).compact_end();
-            // }
-
-            // if (half_bar_end) {
-            //     switch (forest.manifest_log_progress) {
-            //         .idle => unreachable,
-            //         .compacting => unreachable,
-            //         .done => forest.manifest_log.compact_end(),
-            //         .skip => {},
-            //     }
-            //     forest.manifest_log_progress = .idle;
-            // }
-
-            const callback = progress.callback;
-            forest.progress = null;
-            callback(forest);
-        }
-
-        fn compact_end(forest: *Forest) void {
             assert(forest.progress.? == .compact);
             const op = forest.progress.?.compact.op;
 
@@ -828,7 +806,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             forest.compaction_pipeline.beat_end();
 
             // Finish loop, runs only on the last beat of every bar, after all async work is done.
-            // FIXME: This will need to be split oujt into _finish
             if (last_beat) {
                 inline for (0..constants.lsm_levels) |level_b| {
                     inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
@@ -840,7 +817,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
                 }
 
-                // FIXME: actually it shoujld pop and we should assert len == 0.
+                // FIXME: actually it shoujld pop or something and we should assert len == 0.
                 forest.compaction_pipeline.compactions.clear();
             }
 
@@ -848,6 +825,25 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             inline for (std.meta.fields(Grooves)) |field| {
                 @field(forest.grooves, field.name).compact(op);
             }
+
+            // // On the last beat of the bar, make sure that manifest log compaction is finished.
+            // if (half_bar_end and forest.manifest_log_progress == .compacting) return;
+            // FIXME: Do we compact_end the manifest before or after pipeline - keep reverse style.
+            if (last_beat) {
+            switch (forest.manifest_log_progress) {
+                .idle => {},
+                .compacting => unreachable,
+                .done => {
+                    forest.manifest_log.compact_end();
+                    forest.manifest_log_progress = .idle;
+                },
+                .skip => {},
+            }
+            }
+
+            const callback = progress.callback;
+            forest.progress = null;
+            callback(forest);
         }
 
         fn compact_manifest_log_callback(manifest_log: *ManifestLog) void {
