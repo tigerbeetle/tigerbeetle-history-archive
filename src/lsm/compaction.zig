@@ -259,7 +259,7 @@ pub fn CompactionType(
             pub fn copy(self: *ValueBlockIterator, table_builder: *Table.Builder) void {
                 assert(table_builder.value_count < Table.layout.block_value_count_max);
 
-                const values_in = &self.values[self.source_index..];
+                const values_in = self.values[self.source_index..];
                 const values_out = table_builder.data_block_values();
 
                 var values_out_index = table_builder.value_count;
@@ -288,9 +288,10 @@ pub fn CompactionType(
 
             dispatcher: Dispatcher,
 
+            // FIXME: Do we want this iterator to return ptrs rather?
             pub fn next(self: *UnifiedIterator) ?Table.Value {
                 return switch (self.dispatcher) {
-                    inline else => |iterator_impl| iterator_impl.next(),
+                    inline else => |*iterator_impl| iterator_impl.next(),
                 };
             }
 
@@ -308,7 +309,7 @@ pub fn CompactionType(
 
             pub fn copy(self: *UnifiedIterator, table_builder: *Table.Builder) void {
                 return switch (self.dispatcher) {
-                    inline else => |iterator_impl| iterator_impl.copy(table_builder),
+                    inline else => |*iterator_impl| iterator_impl.copy(table_builder),
                 };
             }
         };
@@ -1442,12 +1443,12 @@ pub fn CompactionType(
             // Merge as many values as possible.
             while (values_in_a.next()) |value_a| {
                 // FIXME: Check values_out_index < values_out.len
-                if (tombstone(value_a)) {
+                if (tombstone(&value_a)) {
                     // TODO: What's the impact of this check?
                     assert(Table.usage != .secondary_index);
                     continue;
                 }
-                values_out[values_out_index] = value_a.*;
+                values_out[values_out_index] = value_a;
                 values_out_index += 1;
             }
 

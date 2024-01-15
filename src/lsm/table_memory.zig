@@ -113,7 +113,7 @@ pub fn TableMemoryType(comptime Table: type) type {
 
                 assert(self.remaining() > 0);
 
-                var len = 0;
+                var len: usize = 0;
                 while (self.next()) |val| {
                     values_out[values_out_index] = val;
                     if (values_out_index == Table.layout.block_value_count_max) break;
