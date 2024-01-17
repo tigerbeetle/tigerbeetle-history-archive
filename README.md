@@ -1,3 +1,16 @@
+Archive of Git history of TigerBeetle, before the grand history rewrite to remove accidentally
+committed large files.
+
+The up-to-date version of repository is at
+
+http://github.com/tigerbeetle/tigerbeetle
+
+History-rewrite commit:
+
+https://github.com/tigerbeetle/tigerbeetle/commit/d7c3f4654ea7c65b6d141be33dadd29e869c3984
+
+---
+
 # tigerbeetle
 
 *TigerBeetle is a financial accounting database designed for mission critical safety and performance to power the future of financial services.*
