@@ -168,9 +168,9 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
             };
         }
 
-        pub fn blip_cpu(self: *Self, callback: BlipCallback) void {
+        pub fn blip_merge(self: *Self, callback: BlipCallback) void {
             return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_cpu(callback, self),
+                inline else => |compaction_impl| compaction_impl.blip_merge(callback, self),
             };
         }
 
@@ -216,7 +216,7 @@ pub fn CompactionType(
         const tombstone = Table.tombstone;
 
         const TableInfoA = union(enum) {
-            immutable: Tree.TableMemory.Iterator,
+            immutable: *Tree.TableMemory,
             disk: TableInfoReference,
         };
 
@@ -229,11 +229,11 @@ pub fn CompactionType(
             values: []const Value,
             source_index: usize = 0,
 
-            fn init(values: []const Value) ValueBlockIterator {
-                assert(values.len > 0);
-
+            // FIXME: Useless init fn. Maybe assert stuff idk.
+            fn init(values: []const Value, source_index: usize) ValueBlockIterator {
                 return .{
                     .values = values,
+                    .source_index = source_index,
                 };
             }
 
@@ -307,6 +307,13 @@ pub fn CompactionType(
                 };
             }
 
+            pub fn get_source_index(self: *const UnifiedIterator) usize {
+                return switch (self.dispatcher) {
+                    inline else => |iterator_impl| iterator_impl.source_index,
+                };
+            }
+
+            /// We allow each underlying iterator type to implement its own optimized copy method.
             pub fn copy(self: *UnifiedIterator, table_builder: *Table.Builder) void {
                 return switch (self.dispatcher) {
                     inline else => |*iterator_impl| iterator_impl.copy(table_builder),
@@ -319,10 +326,7 @@ pub fn CompactionType(
             UnifiedIterator,
         };
 
-        // FIXME: Think about how we can assert we're getting called in the right order...
-        // Since cpu() has data dependencies on both read() and write() memory, we have to split it in half (minimum) to get a working
-        // pipeline. We could split it more, but unsure if worth it. This whole structure would need to change.
-        const PipelineStage = enum { read, cpu, write };
+        const PipelineStage = enum { read, merge, write };
 
         const BarContext = struct {
             tree: *Tree,
@@ -354,6 +358,15 @@ pub fn CompactionType(
             total_value_count: u64,
             per_beat_input_goal: u64 = 0,
 
+            /// We have to track our input iterator positions across bars - FIXME: explain why
+            current_block_a_idx: usize = 0,
+            current_block_b_idx: usize = 0,
+
+            /// Track our index position.
+            current_table_a_value_block_index: usize = 0,
+            current_table_b_index_block_index: usize = 0,
+            current_table_b_value_block_index: usize = 0,
+
             /// At least 1 output index block needs to span beat boundaries, otherwise it wouldn't be
             /// possible to pace at a more granular level than tables.
             output_index_blocks: []BlockPtr,
@@ -382,34 +395,30 @@ pub fn CompactionType(
 
         const BeatContext = struct {
             const ReadContext = struct {
-                current_split: usize = 0,
-                active: bool = false,
-                callback: ?BlipCallback = null,
-                ptr: *anyopaque = undefined,
+                callback: BlipCallback,
+                ptr: *anyopaque,
+                pending_index_reads: usize = 0,
+                pending_data_reads: usize = 0,
                 next_tick: Grid.NextTick = undefined,
-                timer: std.time.Timer = undefined,
+                timer: std.time.Timer,
+                timer_read: usize = 0,
             };
-            const CPUContext = struct {
-                current_split: usize = 0,
-                active: bool = false,
-                callback: ?BlipCallback = null,
-                ptr: *anyopaque = undefined,
+            const MergeContext = struct {
+                callback: BlipCallback,
+                ptr: *anyopaque,
                 current_block_a: usize = 0,
                 current_block_b: usize = 0,
-                current_block_a_idx: usize = 0,
-                current_block_b_idx: usize = 0,
                 current_output_data_block: usize = 0,
                 next_tick: Grid.NextTick = undefined,
-                timer: std.time.Timer = undefined,
+                timer: std.time.Timer,
             };
             const WriteContext = struct {
-                current_split: usize = 0,
-                active: bool = false,
-                callback: ?BlipCallback = null,
-                ptr: *anyopaque = undefined,
+                callback: BlipCallback,
+                ptr: *anyopaque,
                 data_blocks_count: usize = 0,
+                pending_writes: usize = 0,
                 next_tick: Grid.NextTick = undefined,
-                timer: std.time.Timer = undefined,
+                timer: std.time.Timer,
             };
 
             grid_reservation: ?Grid.Reservation,
@@ -423,38 +432,57 @@ pub fn CompactionType(
 
             input_values_processed: u64 = 0,
 
-            // Move below into pipeline context?
-            pending_index_reads: usize = 0,
-            pending_data_reads: usize = 0,
+            // Unlike other places where we can use a single state enum, a single Compaction
+            // instance is _expected_ to be reading, writing and merging all at once. These
+            // are not disjoint states!
+            //
+            // {read,merge,write} are considered inactive if their context is null.
+            read: ?ReadContext = null,
+            read_current_split: usize = 0,
 
-            pending_writes: usize = 0,
+            merge: ?MergeContext = null,
+            merge_current_split: usize = 0,
 
-            read: ReadContext = .{},
-            cpu: CPUContext = .{},
-            write: WriteContext = .{},
+            write: ?WriteContext = null,
+            write_current_split: usize = 0,
 
-            fn activate_and_assert(self: *BeatContext, stage: PipelineStage) void {
+            fn activate_and_assert(self: *BeatContext, stage: PipelineStage, callback: BlipCallback, ptr: *anyopaque) void {
                 switch (stage) {
                     .read => {
-                        assert(!self.read.active);
-                        assert(!self.cpu.active or self.cpu.current_split != self.read.current_split);
-                        assert(!self.write.active or self.read.current_split == self.write.current_split);
+                        assert(self.read == null);
+                        assert(self.merge == null or self.merge_current_split != self.read_current_split);
+                        assert(self.write == null or self.read_current_split == self.write_current_split);
 
-                        self.read.active = true;
+                        self.read = .{
+                            .callback = callback,
+                            .ptr = ptr,
+                            .timer = std.time.Timer.start() catch unreachable,
+                        };
+                        self.read.?.timer.reset();
                     },
-                    .cpu => {
-                        assert(!self.cpu.active);
-                        assert(!self.read.active or self.cpu.current_split != self.read.current_split);
-                        assert(!self.write.active or self.cpu.current_split != self.write.current_split);
+                    .merge => {
+                        assert(self.merge == null);
+                        assert(self.read == null or self.merge_current_split != self.read_current_split);
+                        assert(self.write == null or self.merge_current_split != self.write_current_split);
 
-                        self.cpu.active = true;
+                        self.merge = .{
+                            .callback = callback,
+                            .ptr = ptr,
+                            .timer = std.time.Timer.start() catch unreachable,
+                        };
+                        self.merge.?.timer.reset();
                     },
                     .write => {
-                        assert(!self.write.active);
-                        assert(!self.cpu.active or self.cpu.current_split != self.write.current_split);
-                        assert(!self.read.active or self.read.current_split == self.write.current_split);
+                        assert(self.write == null);
+                        assert(self.merge == null or self.merge_current_split != self.write_current_split);
+                        assert(self.read == null or self.read_current_split == self.write_current_split);
 
-                        self.write.active = true;
+                        self.write = .{
+                            .callback = callback,
+                            .ptr = ptr,
+                            .timer = std.time.Timer.start() catch unreachable,
+                        };
+                        self.write.?.timer.reset();
                     },
                 }
             }
@@ -462,41 +490,38 @@ pub fn CompactionType(
             fn deactivate_and_assert_and_callback(self: *BeatContext, stage: PipelineStage, arg1: ?bool, arg2: ?bool) void {
                 switch (stage) {
                     .read => {
-                        assert(self.read.active);
-                        assert(self.read.callback != null);
+                        assert(self.read != null);
+                        assert(self.read.?.pending_index_reads == 0);
+                        assert(self.read.?.pending_data_reads == 0);
 
-                        const callback = self.read.callback.?;
-                        const ptr = self.read.ptr;
+                        const callback = self.read.?.callback;
+                        const ptr = self.read.?.ptr;
 
-                        self.read.current_split = (self.read.current_split + 1) % 2;
-                        self.read.active = false;
-                        self.read.callback = null;
+                        self.read_current_split = (self.read_current_split + 1) % 2;
+                        self.read = null;
 
                         callback(ptr, arg1, arg2);
                     },
-                    .cpu => {
-                        assert(self.cpu.active);
-                        assert(self.cpu.callback != null);
+                    .merge => {
+                        assert(self.merge != null);
 
-                        const callback = self.cpu.callback.?;
-                        const ptr = self.cpu.ptr;
+                        const callback = self.merge.?.callback;
+                        const ptr = self.merge.?.ptr;
 
-                        self.cpu.current_split = (self.cpu.current_split + 1) % 2;
-                        self.cpu.active = false;
-                        self.cpu.callback = null;
+                        self.merge_current_split = (self.merge_current_split + 1) % 2;
+                        self.merge = null;
 
                         callback(ptr, arg1, arg2);
                     },
                     .write => {
-                        assert(self.write.active);
-                        assert(self.write.callback != null);
+                        assert(self.write != null);
+                        assert(self.write.?.pending_writes == 0);
 
-                        const callback = self.write.callback.?;
-                        const ptr = self.write.ptr;
+                        const callback = self.write.?.callback;
+                        const ptr = self.write.?.ptr;
 
-                        self.write.current_split = (self.write.current_split + 1) % 2;
-                        self.write.active = false;
-                        self.write.callback = null;
+                        self.write_current_split = (self.write_current_split + 1) % 2;
+                        self.write = null;
 
                         callback(ptr, arg1, arg2);
                     },
@@ -504,9 +529,9 @@ pub fn CompactionType(
             }
 
             fn assert_all_inactive(self: *BeatContext) void {
-                assert(!self.read.active);
-                assert(!self.cpu.active);
-                assert(!self.write.active);
+                assert(self.read == null);
+                assert(self.merge == null);
+                assert(self.write == null);
             }
         };
 
@@ -572,14 +597,13 @@ pub fn CompactionType(
             // FIXME values_count vs value_count
             var total_value_count: usize = 0;
 
-            // level_b 0 is special; unlike all the others which come from disk, level 0 comes
-            // from the immutable table. This means that blip_read will effectively be a noop, and
-            // that the minimum input blocks are lowered by one. Don't know if we want to make use
-            // of that just yet.
+            // level_b 0 is special; unlike all the others which have a level_a on disk, level 0's
+            // corresponding level_a comes from the immutable table. This means that blip_read will
+            // effectively be a noop, and that the minimum input blocks are lowered by one.
+            // TODO: Don't know if we want to make use of that just yet.
             if (compaction.level_b == 0) {
                 // Do not start compaction if the immutable table does not require compaction.
                 if (tree.table_immutable.mutability.immutable.flushed) {
-                    std.log.info("HNooothing tio odo", .{});
                     return null;
                 }
 
@@ -608,14 +632,18 @@ pub fn CompactionType(
                 });
 
                 total_value_count += values_count;
-                for (range_b.tables.const_slice()) |*table| total_value_count += table.table_info.value_count;
+                for (range_b.tables.const_slice()) |*table| {
+                    // FIXME: We don't deal with this yet.
+                    // if (table.table_info.value_count > 0) assert(false);
+                    total_value_count += table.table_info.value_count;
+                }
 
                 compaction.bar_context = .{
                     .tree = tree,
                     .op_min = op,
 
                     .move_table = false,
-                    .table_info_a = .{ .immutable = tree.table_immutable.iterator() },
+                    .table_info_a = .{ .immutable = &tree.table_immutable },
                     .range_b = range_b,
                     .drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
                         compaction.level_b,
@@ -690,31 +718,31 @@ pub fn CompactionType(
         /// if there's move table, output_index_blocks must be len 0.
         // Minimum of 1, max lsm_growth_factor+1 of output_index_blocks.
         pub fn bar_setup_budget(compaction: *Compaction, beat_budget: u64, output_index_blocks: []BlockPtr) void {
+            assert(beat_budget <= constants.lsm_batch_multiple);
             assert(compaction.bar_context != null);
-            assert(compaction.bar_context.?.per_beat_input_goal == 0);
             assert(compaction.beat_context == null);
-            // FIXME: Assert beat budget is less than or equal to number of beats in a bar :)
 
-            compaction.bar_context.?.per_beat_input_goal = stdx.div_ceil(compaction.bar_context.?.total_value_count, beat_budget);
-            compaction.bar_context.?.output_index_blocks = output_index_blocks;
+            const bar_context = &compaction.bar_context.?;
 
-            if (compaction.bar_context.?.move_table) {
+            assert(bar_context.per_beat_input_goal == 0);
+
+            // FIXME: Actually move this calc into beat_grid_acquire, and subtract the values we've already done from it.
+            // This way we self correct our pacing!
+            bar_context.per_beat_input_goal = stdx.div_ceil(bar_context.total_value_count, beat_budget);
+            bar_context.output_index_blocks = output_index_blocks;
+
+            if (bar_context.move_table) {
                 // FIXME: Asserts here
                 // assert(output_index_blocks.len == 0);
                 // assert(compaction.bar_context.?.per_beat_input_goal == 0);
             } else {
                 assert(output_index_blocks.len > 0);
-                assert(compaction.bar_context.?.per_beat_input_goal > 0);
+                assert(bar_context.per_beat_input_goal > 0);
             }
 
             // FIXME: Ok, so this gets set once, but we do an extra data block. What we should do is recalculate this dynamically after each beat, to better spread
             // the work out....
-            std.log.info("Total: {} per beat goal: {}", .{ compaction.bar_context.?.total_value_count, compaction.bar_context.?.per_beat_input_goal });
-
-            // Set the initial table builder index block.
-            // FIXME: What else can we assert here?
-            // Should also be if ! move table...
-            compaction.bar_context.?.table_builder.set_index_block(output_index_blocks[0]);
+            std.log.info("Total: {} per beat goal: {}", .{ bar_context.total_value_count, bar_context.per_beat_input_goal });
         }
 
         /// Called per beat
@@ -737,31 +765,18 @@ pub fn CompactionType(
             //
             // We must reserve before doing any async work so that the block acquisition order
             // is deterministic (relative to other concurrent compactions).
-            // We then divide the above by the number of beat counts we're targeting.
-
-            // FIXME: It's a bit more complex to be exactly right. A table will have 1 index block
-            // regardless of how many beats we're targeting. We should only divide data blocks?
-            // We should take: value block count = values / values per block
-            // + number of index blocks required to store that many value blocks
-
-            // +1 to count the input table from level A.
-            // FIXME: Actually take in to account value count from ranges and info.
-            const grid_blocks_whole_bar = (bar_context.range_b.tables.count() + 1) * Table.block_count_max;
-            _ = grid_blocks_whole_bar;
-            // FIXME: Use bar_context.per_beat_input_goal
-            const grid_blocks_per_beat = 100; //stdx.div_ceil(grid_blocks_whole_bar, beat_budget);
+            //
+            // We also need to account for index blocks.
+            // FIXME: What if we have partially filled index block from previous beat, that we now fill - do we need a +1?
+            const value_blocks_per_beat = stdx.div_ceil(bar_context.per_beat_input_goal, Table.layout.block_value_count_max);
+            const index_blocks_per_beat = stdx.div_ceil(value_blocks_per_beat, Table.data_block_count_max);
+            const total_blocks_per_beat = index_blocks_per_beat + value_blocks_per_beat;
 
             // TODO The replica must stop accepting requests if it runs out of blocks/capacity,
             // rather than panicking here.
             // (actually, we want to still panic but with something nicer like vsr.fail)
-            const grid_reservation = compaction.grid.reserve(grid_blocks_per_beat).?;
+            const grid_reservation = compaction.grid.reserve(total_blocks_per_beat).?;
 
-            // FIXME: MASSIVE HACK!!
-            if (compaction.bar_context.?.table_builder.state == .no_blocks) {
-                compaction.bar_context.?.table_builder.set_index_block(compaction.bar_context.?.output_index_blocks[0]);
-            }
-
-            std.log.info("Beat context init...", .{});
             compaction.beat_context = .{
                 .grid_reservation = grid_reservation,
                 .grid_reads = undefined,
@@ -785,12 +800,6 @@ pub fn CompactionType(
                 blocks.input_index_blocks.len + blocks.input_data_blocks[0][0].len + blocks.input_data_blocks[0][1].len + blocks.input_data_blocks[1][0].len + blocks.input_data_blocks[1][1].len <= grid_reads.len,
             );
             assert(bar_context.output_index_blocks.len + blocks.output_data_blocks[0].len + blocks.output_data_blocks[1].len <= grid_writes.len);
-
-            // FIXME: This sets the initial data block...
-            if (bar_context.table_builder.state == .index_block) {
-                std.log.info("Setting write block...... to split: {}", .{beat_context.write.current_split});
-                bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.write.current_split][0]);
-            }
         }
 
         // Our blip pipeline is 3 stages long, and split into Read, Cpu and Write. Within a single compaction,
@@ -844,17 +853,10 @@ pub fn CompactionType(
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
 
-            beat_context.activate_and_assert(.read);
+            beat_context.activate_and_assert(.read, callback, ptr);
 
-            // FIXME: Move these to activate and assert?
-            beat_context.read.callback = callback;
-            beat_context.read.ptr = ptr;
-
-            compaction.grid.on_next_tick(blip_read_next_tick, &beat_context.read.next_tick);
-
-            // callback:  void
             // FIXME: Verify the value count matches the number of values we actually compact.
-            // compaction.blip_read_index();
+            compaction.blip_read_index();
         }
 
         fn blip_read_index(compaction: *Compaction) void {
@@ -864,6 +866,9 @@ pub fn CompactionType(
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
 
+            assert(beat_context.read != null);
+            const read = &beat_context.read.?;
+
             // index_block_a will always point to input_index_blocks[0] (even though if our source is immutable this isn't needed! future optimization)
             // index_block_b will be the index block of the table we're currently merging with. This will start from the left and move to the right
             // (although we might want to be able to reverse that in future...)
@@ -872,6 +877,7 @@ pub fn CompactionType(
             switch (bar_context.table_info_a) {
                 .disk => |table_ref| {
                     beat_context.grid_reads[read_target].target = compaction;
+                    beat_context.grid_reads[read_target].hack = read_target;
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_index_callback },
                         &beat_context.grid_reads[read_target].read,
@@ -879,17 +885,19 @@ pub fn CompactionType(
                         table_ref.table_info.checksum,
                         .{ .cache_read = true, .cache_write = true },
                     );
-                    beat_context.pending_index_reads += 1;
-                    read_target += 1;
+                    read.pending_index_reads += 1;
                 },
                 .immutable => {
                     // Immutable values come from the in memory immutable table - no need to do any reads.
                 },
             }
+            // ALWAYS increment read_target for now.
+            read_target += 1;
 
             // FIXME: This of course assumes infinite buffer space :)
             for (bar_context.range_b.tables.const_slice()) |table_ref| {
                 beat_context.grid_reads[read_target].target = compaction;
+                beat_context.grid_reads[read_target].hack = read_target;
                 compaction.grid.read_block(
                     .{ .from_local_or_global_storage = blip_read_index_callback },
                     &beat_context.grid_reads[read_target].read,
@@ -897,20 +905,21 @@ pub fn CompactionType(
                     table_ref.table_info.checksum,
                     .{ .cache_read = true, .cache_write = true },
                 );
-                beat_context.pending_index_reads += 1;
+                read.pending_index_reads += 1;
                 read_target += 1;
             }
 
-            // FIXME: handle pending_index_reads being 0; call our callback via next_tick directly.
-
-            // log.info(
-            //     "{s}: Merging table: level_b={}",
-            //     .{ compaction.tree_config.name, context.level_b },
-            // );
+            // Either we have pending index reads, in which case blip_read_data gets called by
+            // blip_read_index_callback once all reads are done, or we don't, in which case call it
+            // here.
+            if (read.pending_index_reads == 0) {
+                return compaction.blip_read_data();
+            }
         }
 
-        fn blip_read_index_callback(read: *Grid.Read, index_block: BlockPtrConst) void {
-            const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", read).target));
+        fn blip_read_index_callback(grid_read: *Grid.Read, index_block: BlockPtrConst) void {
+            const parent = @fieldParentPtr(Grid.FatRead, "read", grid_read);
+            const compaction: *Compaction = @alignCast(@ptrCast(parent.target));
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
             assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
@@ -919,34 +928,125 @@ pub fn CompactionType(
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
 
-            // const index_schema_a = schema.TableIndex.from(compaction.index_block_a);
-            // compaction.iterator_a.start(.{
-            //     .grid = compaction.grid,
-            //     .addresses = index_schema_a.data_addresses_used(compaction.index_block_a),
-            //     .checksums = index_schema_a.data_checksums_used(compaction.index_block_a),
-            //     .direction = .ascending,
-            // });
-            // compaction.release_table_blocks(compaction.index_block_a);
+            // FIXME: Figure out where our read target should go in a better way...
+            assert(beat_context.read != null);
+            const read = &beat_context.read.?;
 
-            // FIXME: Figure out where our read target should go. We can do this by looking at the address and comparing to table_info_a / range_b.
+            read.pending_index_reads -= 1;
+            read.timer_read += 1;
 
-            beat_context.pending_index_reads -= 1;
+            const read_index = parent.hack;
+            stdx.copy_disjoint(.exact, u8, beat_context.blocks.input_index_blocks[read_index], index_block);
+            std.log.info("Copied index block to {}", .{read_index});
 
             // FIXME: Not sure if I like this too much. According to release_table_blocks, it'll only release at the end of the bar, so should be ok?
             // FIXME: It's critical to release blocks, so ensure this is done properly.
             compaction.release_table_blocks(index_block);
 
-            if (beat_context.pending_index_reads != 0) return;
+            if (read.pending_index_reads != 0) return;
 
-            std.log.info("No pending index reads!!", .{});
+            compaction.blip_read_data();
         }
 
         fn blip_read_data(compaction: *Compaction) void {
-            _ = compaction;
+            assert(compaction.bar_context != null);
+            assert(compaction.beat_context != null);
+
+            const bar_context = &compaction.bar_context.?;
+            const beat_context = &compaction.beat_context.?;
+
+            assert(beat_context.read != null);
+            const read = &beat_context.read.?;
+
+            read.timer_read += 1;
+
+            // Used to select the Grid.Read to use - so shared between table a and table b.
+            var read_target: usize = 0;
+
+            // Read data for table a - which we'll only have if we're coming from disk.
+            if (bar_context.table_info_a == .disk) {
+                const index_block = beat_context.blocks.input_index_blocks[0];
+                const index_schema = schema.TableIndex.from(index_block);
+
+                const data_blocks_used = index_schema.data_blocks_used(index_block);
+                assert(bar_context.current_table_a_value_block_index < data_blocks_used);
+
+                const data_block_addresses = index_schema.data_addresses_used(index_block);
+                const data_block_checksums = index_schema.data_checksums_used(index_block);
+
+                // Issue as many reads as we have space for.
+                var data_blocks_read: usize = 0;
+
+                while (data_blocks_read < beat_context.blocks.input_data_blocks[beat_context.read_current_split][0].len and data_blocks_read < data_blocks_used) {
+                    beat_context.grid_reads[read_target].target = compaction;
+                    beat_context.grid_reads[read_target].hack = read_target;
+                    compaction.grid.read_block(
+                        .{ .from_local_or_global_storage = blip_read_data_callback },
+                        &beat_context.grid_reads[read_target].read,
+                        data_block_addresses[data_blocks_read],
+                        data_block_checksums[data_blocks_read].value,
+                        .{ .cache_read = true, .cache_write = true },
+                    );
+
+                    read.pending_data_reads += 1;
+                    read_target += 1;
+                    data_blocks_read += 1;
+                }
+            }
+
+            // Read data for our tables in range b.
+            const table_b_count = bar_context.range_b.tables.count();
+
+            var previous_schema: ?schema.TableIndex = null;
+            outer: while (bar_context.current_table_b_index_block_index < table_b_count) : (bar_context.current_table_b_index_block_index += 1) {
+                // The 1 + is to skip over the table a index block.
+                const index_block = beat_context.blocks.input_index_blocks[1 + bar_context.current_table_b_index_block_index];
+                const index_schema = schema.TableIndex.from(index_block);
+                assert(previous_schema == null or stdx.equal_bytes(schema.TableIndex, &previous_schema.?, &index_schema));
+                previous_schema = index_schema;
+
+                const data_blocks_used = index_schema.data_blocks_used(index_block);
+                assert(bar_context.current_table_b_value_block_index < data_blocks_used);
+
+                const data_block_addresses = index_schema.data_addresses_used(index_block);
+                const data_block_checksums = index_schema.data_checksums_used(index_block);
+
+                // Issue as many reads as we have space for.
+                var data_blocks_read: usize = 0;
+
+                // Try read in as many value blocks as this index block has...
+                while (data_blocks_read < data_blocks_used) {
+                    beat_context.grid_reads[read_target].target = compaction;
+                    beat_context.grid_reads[read_target].hack = read_target;
+                    compaction.grid.read_block(
+                        .{ .from_local_or_global_storage = blip_read_data_callback },
+                        &beat_context.grid_reads[read_target].read,
+                        data_block_addresses[data_blocks_read],
+                        data_block_checksums[data_blocks_read].value,
+                        .{ .cache_read = true, .cache_write = true },
+                    );
+
+                    read.pending_data_reads += 1;
+                    read_target += 1;
+                    data_blocks_read += 1;
+
+                    // But, once our read buffer is full, break out of the outer loop.
+                    if (data_blocks_read < beat_context.blocks.input_data_blocks[beat_context.read_current_split][1].len) {
+                        break :outer;
+                    }
+                }
+            }
+
+            // Either we have pending data reads, in which case blip_read_next_tick gets called by
+            // blip_read_data_callback once all reads are done, or we don't, in which case call it
+            // here via next_tick.
+            if (read.pending_data_reads == 0) {
+                compaction.grid.on_next_tick(blip_read_next_tick, &read.next_tick);
+            }
         }
 
-        fn blip_read_data_callback(read: *Grid.Read, block: BlockPtrConst) void {
-            const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", read).target));
+        fn blip_read_data_callback(grid_read: *Grid.Read, block: BlockPtrConst) void {
+            const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", grid_read).target));
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -955,14 +1055,22 @@ pub fn CompactionType(
             const beat_context = &compaction.beat_context.?;
             _ = block;
 
-            beat_context.pending_data_reads -= 1;
-            if (beat_context.pending_data_reads != 0) return;
+            assert(beat_context.read != null);
+            const read = &beat_context.read.?;
 
-            beat_context.deactivate_and_assert(.read);
+            read.pending_data_reads -= 1;
+            if (read.pending_data_reads != 0) return;
+
+            const d = read.timer.read();
+            std.log.info("Took {} to read all blocks - {}", .{ std.fmt.fmtDuration(d), read.timer_read });
+
+            // Call the next tick handler directly. We have already been next_tick'd through, so this is safe from stack
+            // overflows.
+            blip_read_next_tick(&read.next_tick);
         }
 
         fn blip_read_next_tick(next_tick: *Grid.NextTick) void {
-            const read_context = @fieldParentPtr(BeatContext.ReadContext, "next_tick", next_tick);
+            const read_context: *?BeatContext.ReadContext = @ptrCast(@fieldParentPtr(BeatContext.ReadContext, "next_tick", next_tick));
             const beat_context = @fieldParentPtr(BeatContext, "read", read_context);
             // const beat_context: *?BeatContext = @ptrCast(@fieldParentPtr(BeatContext, "pipeline_context", pipeline_context));
             // const compaction = @fieldParentPtr(Compaction, "beat_context", beat_context);
@@ -973,16 +1081,15 @@ pub fn CompactionType(
 
         fn calculate_values_in(compaction: *Compaction) ValuesIn {
             assert(compaction.beat_context != null);
+            const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
-            const cpu = &beat_context.cpu;
+            const cpu = &beat_context.merge.?;
 
-            const blocks_a = beat_context.blocks.input_data_blocks[cpu.current_split][0];
-            const blocks_b = beat_context.blocks.input_data_blocks[cpu.current_split][1];
-            _ = blocks_b;
+            const blocks_a = beat_context.blocks.input_data_blocks[beat_context.merge_current_split][0];
+            const blocks_b = beat_context.blocks.input_data_blocks[beat_context.merge_current_split][1];
 
             // FIXME: TODO handle when we have b tables lol
-            // const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
-            const values_b: []const Value = &.{};
+            const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b]);
 
             // // Assert that we're reading data blocks in key order.
             // const values_in = compaction.values_in[index];
@@ -1007,21 +1114,22 @@ pub fn CompactionType(
                 .immutable => {
                     return .{
                         UnifiedIterator{ .dispatcher = .{
-                            .table_memory_iterator = compaction.bar_context.?.table_info_a.immutable,
+                            .table_memory_iterator = Tree.TableMemory.Iterator.init(bar_context.table_info_a.immutable, bar_context.current_block_a_idx),
                         } },
                         UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlockIterator.init(values_b),
+                            .value_block_iterator = ValueBlockIterator.init(values_b, bar_context.current_block_b_idx),
                         } },
                     };
                 },
                 .disk => {
-                    const values_a = Table.data_block_values_used(blocks_a[cpu.current_block_a])[cpu.current_block_a_idx..];
+                    assert(false); // FIXME: Unimplemented for now.
+                    const values_a = Table.data_block_values_used(blocks_a[cpu.current_block_a]);
                     return .{
                         UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlockIterator.init(values_a),
+                            .value_block_iterator = ValueBlockIterator.init(values_a, bar_context.current_block_a_idx),
                         } },
                         UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlockIterator.init(values_b),
+                            .value_block_iterator = ValueBlockIterator.init(values_b, bar_context.current_block_b_idx),
                         } },
                     };
                 },
@@ -1038,42 +1146,45 @@ pub fn CompactionType(
         // * We have no more output index blocks remaining - we might have a partial data block here, but that's OK.
         // * We have no more input blocks remaining:
         //   * FIXME: Flesh out the cases here
-        pub fn blip_cpu(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
+        pub fn blip_merge(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
 
-            beat_context.activate_and_assert(.cpu);
-            beat_context.cpu.callback = callback;
-            beat_context.cpu.ptr = ptr;
+            beat_context.activate_and_assert(.merge, callback, ptr);
 
-            beat_context.cpu.timer = std.time.Timer.start() catch unreachable;
-            beat_context.cpu.timer.reset();
+            assert(beat_context.merge != null);
+            const merge = &beat_context.merge.?;
 
             var beat_exhausted = false;
             var bar_exhausted = false;
 
             // FIXME: No while true loops!
-            outer: while (true) {
+            var i: usize = 0;
+            outer: while (true) : (i += 1) {
                 assert(bar_context.table_builder.value_count < Table.layout.block_value_count_max);
 
                 var values_in = compaction.calculate_values_in();
-                // if (values_in == .need_read) {
-                //     // FIXME: Assert that we never need_read on our first iteration.
-                //     // FIXME: TODO
-                //     return;
-                // }
 
                 var values_in_a_len = values_in[0].remaining();
                 var values_in_b_len = values_in[1].remaining();
 
-                // Set the data block if needed
-                if (bar_context.table_builder.state == .index_block)
-                    bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.cpu.current_split][beat_context.cpu.current_output_data_block]);
+                // Set the index block if needed.
+                if (bar_context.table_builder.state == .no_blocks) {
+                    bar_context.table_builder.set_index_block(bar_context.output_index_blocks[bar_context.current_index_block]);
+                }
 
-                std.log.info("blip_cpu: values_a: {} and values_b: {} current cpu split: {}", .{ values_in_a_len, values_in_b_len, beat_context.cpu.current_split });
+                // Set the data block if needed.
+                if (bar_context.table_builder.state == .index_block) {
+                    bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.merge_current_split][merge.current_output_data_block]);
+                } else {
+                    // FIXME: Figure this out.
+                    assert(i > 0);
+                }
+
+                std.log.info("blip_merge: values_a: {} and values_b: {} current cpu split: {}", .{ values_in_a_len, values_in_b_len, beat_context.merge_current_split });
 
                 // We are responsible for not iterating again if all work is done.
                 assert(values_in_a_len > 0 or values_in_b_len > 0);
@@ -1089,12 +1200,16 @@ pub fn CompactionType(
                             values_in[0].copy(&bar_context.table_builder);
                         }
                     } else {
-                        merge(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
+                        merge_fn(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
                     }
 
                     // FIXME: Update these in a nicer way...
                     const values_in_a_len_new = values_in[0].remaining();
                     const values_in_b_len_new = values_in[1].remaining();
+
+                    // Save our iterator position
+                    bar_context.current_block_a_idx = values_in[0].get_source_index();
+                    bar_context.current_block_b_idx = values_in[1].get_source_index();
 
                     beat_context.input_values_processed += (values_in_a_len - values_in_a_len_new) + (values_in_b_len - values_in_b_len_new);
                     values_in_a_len = values_in_a_len_new;
@@ -1123,8 +1238,9 @@ pub fn CompactionType(
                         // If we have to write, we need to break out of the outer loop.
                         .need_write => {
                             // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
-                            beat_context.write.data_blocks_count = beat_context.cpu.current_output_data_block;
-                            beat_context.cpu.current_output_data_block = 0; // FIXME: HACK where to we do resetting between etc!!
+                            // FIXME: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+                            // FIXME: SUPER NB! We need to tell our write stage how many blocks to write! This is beat context since it crosses stages!
+                            // beat_context.write.data_blocks_count = merge.current_output_data_block;
                             break :outer;
                         },
                     }
@@ -1135,10 +1251,10 @@ pub fn CompactionType(
             // assert(filled <= target.len);
             // if (filled == 0) assert(Table.usage == .secondary_index);
 
-            const d = beat_context.cpu.timer.read();
+            const d = merge.timer.read();
             std.log.info("Took {} to CPU merge block", .{std.fmt.fmtDuration(d)});
 
-            beat_context.deactivate_and_assert_and_callback(.cpu, beat_exhausted or bar_exhausted, bar_exhausted);
+            beat_context.deactivate_and_assert_and_callback(.merge, beat_exhausted or bar_exhausted, bar_exhausted);
         }
 
         // FIXME: Make input_exhausted a struct rather
@@ -1148,9 +1264,9 @@ pub fn CompactionType(
 
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
-            const cpu = &beat_context.cpu;
 
-            assert(cpu.active);
+            assert(beat_context.merge != null);
+            const merge = &beat_context.merge.?;
 
             // If the index block is force flushed, the data block must be too.
             assert(!force_flush.index_block or force_flush.data_block);
@@ -1175,10 +1291,9 @@ pub fn CompactionType(
                 });
                 std.log.info("Finished data block", .{});
 
-                // FIXME: OK, we need to set our data block at the beginning, rather than at the end.
-                cpu.current_output_data_block += 1;
+                merge.current_output_data_block += 1;
                 finished_data_block = true;
-                if (cpu.current_output_data_block == beat_context.blocks.output_data_blocks[cpu.current_split].len or force_flush.data_block) {
+                if (merge.current_output_data_block == beat_context.blocks.output_data_blocks[beat_context.merge_current_split].len or force_flush.data_block) {
                     need_write = true;
                 }
             }
@@ -1200,8 +1315,6 @@ pub fn CompactionType(
                 bar_context.current_index_block += 1;
                 if (bar_context.current_index_block == bar_context.output_index_blocks.len or force_flush.index_block) {
                     need_write = true;
-                } else {
-                    table_builder.set_index_block(bar_context.output_index_blocks[bar_context.current_index_block]);
                 }
 
                 // Make this table visible at the end of this bar.
@@ -1224,37 +1337,39 @@ pub fn CompactionType(
             assert(compaction.beat_context != null);
 
             const bar_context = &compaction.bar_context.?;
-            _ = bar_context;
             const beat_context = &compaction.beat_context.?;
-            const write = &beat_context.write;
 
-            write.timer = std.time.Timer.start() catch unreachable;
-            write.timer.reset();
+            assert(beat_context.write != null);
+            const write = &beat_context.write.?;
 
-            beat_context.activate_and_assert(.write);
+            beat_context.activate_and_assert(.write, callback, ptr);
 
-            // FIXME: Move these to activate and assert?
-            beat_context.write.callback = callback;
-            beat_context.write.ptr = ptr;
+            std.log.info("Current write split: {}", .{beat_context.write_current_split});
+
+            var write_index: usize = 0;
 
             // Write any complete index blocks.
-            // FIXME: The interaction of this is painful.
-            // for (beat_context.blocks.output_data_blocks[write.current_split][], 0..) |block, i| {
-            //     compaction.state.tables_writing.pending += 1;
-            //     compaction.grid.create_block(blip_write_callback, write, block);
-            // }
+            for (bar_context.output_index_blocks[0..bar_context.current_index_block]) |*block| {
+                // std.log.info("Issuing a write for split {} block {}", .{ write_current_split, i });
 
-            std.log.info("Current write split: {}", .{write.current_split});
-            // Write any complete data blocks.
-            for (0..write.data_blocks_count) |i| {
-                const block = &beat_context.blocks.output_data_blocks[write.current_split][i];
-                // std.log.info("Issuing a write for split {} block {}", .{ write.current_split, i });
-                beat_context.grid_writes[i].target = compaction;
-                beat_context.pending_writes += 1;
-                compaction.grid.create_block(blip_write_callback, &beat_context.grid_writes[i].write, block);
+                beat_context.grid_writes[write_index].target = compaction;
+                write.pending_writes += 1;
+                compaction.grid.create_block(blip_write_callback, &beat_context.grid_writes[write_index].write, block);
+                write_index += 1;
             }
+
+            // Write any complete data blocks.
+            for (beat_context.blocks.output_data_blocks[beat_context.write_current_split][0..write.data_blocks_count]) |*block| {
+                // std.log.info("Issuing a write for split {} block {}", .{ write_current_split, i });
+
+                beat_context.grid_writes[write_index].target = compaction;
+                write.pending_writes += 1;
+                compaction.grid.create_block(blip_write_callback, &beat_context.grid_writes[write_index].write, block);
+                write_index += 1;
+            }
+
             const d = write.timer.read();
-            std.log.info("Took {} to create block", .{std.fmt.fmtDuration(d)});
+            std.log.info("Took {} to create {} blocks", .{ std.fmt.fmtDuration(d), write_index });
             write.timer.reset();
 
             // FIXME: From 2023-12-21
@@ -1269,8 +1384,8 @@ pub fn CompactionType(
             // beat_context.deactivate_and_assert(.write);
         }
 
-        fn blip_write_callback(write: *Grid.Write) void {
-            const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatWrite, "write", write).target));
+        fn blip_write_callback(grid_write: *Grid.Write) void {
+            const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatWrite, "write", grid_write).target));
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -1278,15 +1393,14 @@ pub fn CompactionType(
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
 
-            // FIXME: Assert write is active, and ditto for other stages callbacks.
-            // assert(compaction.state == .tables_writing);
+            assert(beat_context.write != null);
+            const write = &beat_context.write.?;
+            write.pending_writes -= 1;
 
-            beat_context.pending_writes -= 1;
+            // std.log.info("blip_write_callback for split {}", .{write_current_split});
 
-            // std.log.info("blip_write_callback for split {}", .{beat_context.write.current_split});
-
-            if (beat_context.pending_writes == 0) {
-                const duration = beat_context.write.timer.read();
+            if (write.pending_writes == 0) {
+                const duration = write.timer.read();
                 std.log.info("all writes done - took {}! callback time!!", .{std.fmt.fmtDuration(duration)});
                 beat_context.deactivate_and_assert_and_callback(.write, null, null);
             }
@@ -1306,9 +1420,6 @@ pub fn CompactionType(
             beat_context.assert_all_inactive();
             assert(compaction.bar_context.?.table_builder.data_block_empty());
             // assert(compaction.bar_context.?.table_builder.state == .index_block); // Hmmm
-            assert(beat_context.pending_index_reads == 0);
-            assert(beat_context.pending_data_reads == 0);
-            assert(beat_context.pending_writes == 0);
 
             if (beat_context.grid_reservation) |grid_reservation| {
                 std.log.info("forfeiting... {}", .{grid_reservation});
@@ -1432,7 +1543,9 @@ pub fn CompactionType(
 
         ////////////// The actual CPU merging methods below. //////////////
         // TODO: Add benchmarks for all of these specifically.
+        /// Copy values from table_a to table_b, dropping tombstones as we go.
         fn copy_drop_tombstones(table_builder: *Table.Builder, values_in: *ValuesIn) void {
+            std.log.info("Entering copy_drop_tombstones...", .{});
             assert(values_in[1].remaining() == 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);
 
@@ -1443,7 +1556,6 @@ pub fn CompactionType(
 
             // Merge as many values as possible.
             while (values_in_a.next()) |value_a| {
-                // FIXME: Check values_out_index < values_out.len
                 if (tombstone(&value_a)) {
                     // TODO: What's the impact of this check?
                     assert(Table.usage != .secondary_index);
@@ -1451,14 +1563,18 @@ pub fn CompactionType(
                 }
                 values_out[values_out_index] = value_a;
                 values_out_index += 1;
+
+                if (values_out_index == values_out.len) break;
             }
 
             // Copy variables back out.
             values_in[0] = values_in_a;
             table_builder.value_count = values_out_index;
+
+            std.log.info("Set table builder value to: {}", .{table_builder.value_count});
         }
 
-        fn merge(table_builder: *Table.Builder, values_in: *ValuesIn, drop_tombstones: bool) void {
+        fn merge_fn(table_builder: *Table.Builder, values_in: *ValuesIn, drop_tombstones: bool) void {
             _ = drop_tombstones;
             _ = values_in;
             _ = table_builder;

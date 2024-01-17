@@ -69,6 +69,7 @@ pub fn GridType(comptime Storage: type) type {
         pub const FatWrite = struct {
             write: Grid.Write = undefined,
             target: *anyopaque = undefined,
+            hack: usize = 0,
         };
 
         const WriteIOP = struct {
@@ -118,6 +119,7 @@ pub fn GridType(comptime Storage: type) type {
         pub const FatRead = struct {
             read: Grid.Read = undefined,
             target: *anyopaque = undefined,
+            hack: usize = 0,
         };
 
         /// Although we distinguish between the reasons why the block is invalid, we only use this

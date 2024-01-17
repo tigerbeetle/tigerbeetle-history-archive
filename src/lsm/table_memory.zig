@@ -17,9 +17,9 @@ pub fn TableMemoryType(comptime Table: type) type {
 
         pub const Iterator = struct {
             table_memory: *TableMemory,
-            source_index: usize = 0,
+            source_index: usize,
 
-            fn init(table_memory: *TableMemory) Iterator {
+            pub fn init(table_memory: *TableMemory, source_index: usize) Iterator {
                 const source = table_memory.values_used();
                 assert(source.len > 0);
 
@@ -43,6 +43,7 @@ pub fn TableMemoryType(comptime Table: type) type {
 
                 return .{
                     .table_memory = table_memory,
+                    .source_index = source_index,
                 };
             }
 

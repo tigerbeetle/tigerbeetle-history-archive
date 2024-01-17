@@ -173,7 +173,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const PipelineSlot = struct {
                 interface: CompactionInterface,
                 pipeline: *CompactionPipeline,
-                active_operation: enum { read, cpu, write },
+                active_operation: enum { read, merge, write },
                 index: usize,
             };
 
@@ -434,8 +434,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 } else @panic("no matching slot");
 
                 // Currently only CPU is allowed to tell us we're exhausted.
-                assert(maybe_beat_exhausted == null or slot.active_operation == .cpu);
-                assert(maybe_bar_exhausted == null or slot.active_operation == .cpu);
+                assert(maybe_beat_exhausted == null or slot.active_operation == .merge);
+                assert(maybe_bar_exhausted == null or slot.active_operation == .merge);
 
                 if (maybe_beat_exhausted) |beat_exhausted| {
                     pipeline.beat_exhausted = beat_exhausted;
@@ -481,7 +481,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                                 // have to do anything explicit to discard, we just need to increment our compaction state.
                             }
                         },
-                        .cpu => {
+                        .merge => {
                             slot.*.?.active_operation = .write;
                             std.log.info("Slot: {} Index: {} Entering blip_write", .{ i, slot.*.?.index });
                             self.active_slot_count += 1;
@@ -536,10 +536,10 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                 // Only then start CPU work.
                 if (cpu) |c| {
-                    self.slots[c].?.active_operation = .cpu;
-                    std.log.info("Slot: {}, Index: {} Entering blip_cpu", .{ c, self.slots[c].?.index });
+                    self.slots[c].?.active_operation = .merge;
+                    std.log.info("Slot: {}, Index: {} Entering blip_merge", .{ c, self.slots[c].?.index });
                     self.active_slot_count += 1;
-                    self.slots[c].?.interface.blip_cpu(blip_callback);
+                    self.slots[c].?.interface.blip_merge(blip_callback);
                 }
             }
 
@@ -830,15 +830,15 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             // if (half_bar_end and forest.manifest_log_progress == .compacting) return;
             // FIXME: Do we compact_end the manifest before or after pipeline - keep reverse style.
             if (last_beat) {
-            switch (forest.manifest_log_progress) {
-                .idle => {},
-                .compacting => unreachable,
-                .done => {
-                    forest.manifest_log.compact_end();
-                    forest.manifest_log_progress = .idle;
-                },
-                .skip => {},
-            }
+                switch (forest.manifest_log_progress) {
+                    .idle => {},
+                    .compacting => unreachable,
+                    .done => {
+                        forest.manifest_log.compact_end();
+                        forest.manifest_log_progress = .idle;
+                    },
+                    .skip => {},
+                }
             }
 
             const callback = progress.callback;
